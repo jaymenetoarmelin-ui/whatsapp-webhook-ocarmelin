@@ -71,7 +71,26 @@ def receber_webhook():
     except Exception as exc:  # noqa: BLE001 — nunca pode derrubar o endpoint
         print(f"[ERRO] processando webhook: {exc}")
     return jsonify({"status": "ok"}), 200
+  
+@app.route("/privacidade")
+def politica_privacidade():
+    return """
+    <h1>Política de Privacidade — Captura Dados (OCArmelin)</h1>
+    <p>Este aplicativo é de uso interno da Organização Contábil Armelin e
+    recebe mensagens do WhatsApp enviadas por clientes (pacientes/clínicas)
+    para fins de emissão de nota fiscal de serviço (NFS-e).</p>
+    <p>As mensagens recebidas (texto, imagens e documentos) são
+    encaminhadas por e-mail para a caixa interna da contabilidade
+    (ocarmelin@ocarmelin.com.br) e usadas apenas para identificar dados
+    da nota fiscal a ser emitida (nome, valor, data do serviço).</p>
+    <p>Não compartilhamos esses dados com terceiros, exceto quando
+    exigido pela emissão da própria nota fiscal junto à Receita Federal /
+    prefeituras (Sistema Nacional NFS-e).</p>
+    <p>Para dúvidas ou solicitação de exclusão de dados, entre em
+    contato: ocarmelin@ocarmelin.com.br</p>
+    """
 
+</parameter>
 
 @app.route("/")
 def raiz():
