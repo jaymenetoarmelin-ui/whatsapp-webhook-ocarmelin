@@ -90,8 +90,6 @@ def politica_privacidade():
     contato: ocarmelin@ocarmelin.com.br</p>
     """
 
-</parameter>
-
 @app.route("/")
 def raiz():
     return "OK — webhook do robô de captura WhatsApp está no ar."
