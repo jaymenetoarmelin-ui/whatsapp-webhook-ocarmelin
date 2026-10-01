@@ -15,10 +15,19 @@ digitadas direto no código):
                       é você mesmo configurando).
   WHATSAPP_TOKEN    - o token de acesso PERMANENTE do app da Meta (não o
                       temporário da Etapa 1 — esse expira em horas).
-  SMTP_USER         - ocarmelin@ocarmelin.com.br
-  SMTP_PASSWORD     - senha (ou senha de app) da caixa ocarmelin@ocarmelin.com.br
-  DESTINO_EMAIL     - opcional; se não definir, usa o próprio SMTP_USER
-                      como destinatário.
+
+O envio do e-mail de repasse é feito via Microsoft Graph (API-only, sem
+SMTP — o Render bloqueia conexões SMTP de saída, por isso NÃO usamos
+smtplib aqui):
+
+  MS_CLIENT_ID      - Application (client) ID do app "robo-whatsapp-email"
+                      no Azure AD.
+  MS_CLIENT_SECRET  - client secret desse mesmo app.
+  MS_TENANT_ID      - Directory (tenant) ID da conta Microsoft 365.
+  REMETENTE_EMAIL   - ocarmelin@ocarmelin.com.br (caixa usada tanto como
+                      remetente quanto destinatária do e-mail de repasse;
+                      o app precisa da permissão de aplicativo Mail.Send
+                      já concedida/consentida no Azure).
 
 NOVO (01/10/2026, a pedido) — também expõe POST /responder: o robô de
 emissão (rodando no PC, depois de emitir uma nota) chama esse endpoint
@@ -34,9 +43,9 @@ Variáveis de ambiente adicionais pra isso:
                       um na internet.
 """
 
+import base64
 import os
-import smtplib
-from email.message import EmailMessage
+import time
 
 import requests
 from flask import Flask, request, jsonify
@@ -45,9 +54,13 @@ app = Flask(__name__)
 
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]
-SMTP_USER = os.environ["SMTP_USER"]
-SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
-DESTINO_EMAIL = os.environ.get("DESTINO_EMAIL", SMTP_USER)
+
+# Envio de e-mail via Microsoft Graph (não SMTP — ver docstring acima).
+MS_CLIENT_ID = os.environ["MS_CLIENT_ID"]
+MS_CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]
+MS_TENANT_ID = os.environ["MS_TENANT_ID"]
+REMETENTE_EMAIL = os.environ["REMETENTE_EMAIL"]
+DESTINO_EMAIL = os.environ.get("DESTINO_EMAIL", REMETENTE_EMAIL)
 
 # NOVO — usados só pelo endpoint /responder (ver docstring acima). Lidos
 # com .get() (não os["..."]) pra não derrubar o serviço inteiro se ainda
@@ -58,6 +71,33 @@ WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 RESPONDER_SECRET = os.environ.get("RESPONDER_SECRET", "")
 
 GRAPH_URL = "https://graph.facebook.com/v25.0"
+
+# --- cache simples do token do Graph (client-credentials), pra não pedir
+# um token novo a cada e-mail — eles duram ~1h, renovamos uns minutos antes
+# de expirar.
+_graph_token_cache = {"token": None, "expira_em": 0}
+
+
+def obter_token_graph():
+    agora = time.time()
+    if _graph_token_cache["token"] and agora < _graph_token_cache["expira_em"] - 120:
+        return _graph_token_cache["token"]
+
+    resp = requests.post(
+        f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": MS_CLIENT_ID,
+            "client_secret": MS_CLIENT_SECRET,
+            "scope": "https://graph.microsoft.com/.default",
+        },
+        timeout=20,
+    )
+    resp.raise_for_status()
+    dados = resp.json()
+    _graph_token_cache["token"] = dados["access_token"]
+    _graph_token_cache["expira_em"] = agora + int(dados.get("expires_in", 3600))
+    return _graph_token_cache["token"]
 
 
 @app.route("/webhook", methods=["GET"])
@@ -194,21 +234,44 @@ def baixar_midia(media_id):
 
 
 def enviar_email(remetente, nome_contato, texto, anexos):
-    msg = EmailMessage()
+    """Manda o e-mail de repasse via Microsoft Graph (/users/{...}/sendMail),
+    com autenticação de aplicativo (client credentials) — SEM SMTP, porque
+    o Render bloqueia conexões SMTP de saída."""
     quem = f"{nome_contato} ({remetente})" if nome_contato else remetente
-    msg["Subject"] = f"WhatsApp - {quem}"
-    msg["From"] = SMTP_USER
-    msg["To"] = DESTINO_EMAIL
-    msg.set_content(texto or "(mensagem sem texto — ver anexo)")
 
-    for nome_arquivo, conteudo, mime in anexos:
-        tipo_principal, subtipo = mime.split("/", 1)
-        msg.add_attachment(conteudo, maintype=tipo_principal, subtype=subtipo, filename=nome_arquivo)
+    corpo_mensagem = {
+        "subject": f"WhatsApp - {quem}",
+        "body": {
+            "contentType": "Text",
+            "content": texto or "(mensagem sem texto — ver anexo)",
+        },
+        "toRecipients": [{"emailAddress": {"address": DESTINO_EMAIL}}],
+    }
 
-    with smtplib.SMTP("smtp.office365.com", 587) as servidor:
-        servidor.starttls()
-        servidor.login(SMTP_USER, SMTP_PASSWORD)
-        servidor.send_message(msg)
+    if anexos:
+        corpo_mensagem["attachments"] = [
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": nome_arquivo,
+                "contentType": mime,
+                "contentBytes": base64.b64encode(conteudo).decode("ascii"),
+            }
+            for nome_arquivo, conteudo, mime in anexos
+        ]
+
+    token = obter_token_graph()
+    resp = requests.post(
+        f"https://graph.microsoft.com/v1.0/users/{REMETENTE_EMAIL}/sendMail",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={"message": corpo_mensagem, "saveToSentItems": "false"},
+        timeout=30,
+    )
+    if resp.status_code >= 300:
+        print(f"[ERRO] Graph recusou o envio do e-mail de repasse: {resp.status_code} {resp.text}")
+        resp.raise_for_status()
 
 
 if __name__ == "__main__":
