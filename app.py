@@ -3,22 +3,40 @@
 """
 Webhook do WhatsApp Business Cloud API (Meta) -> repassa cada mensagem
 recebida (texto + anexos: foto, PDF, áudio) como um e-mail pra
-ocarmelin@ocarmelin.com.br, via Microsoft Graph API (não SMTP — o Render
-bloqueia a porta SMTP de saída), reaproveitando o mesmo fluxo de captura
-de dados que já lê e-mails de outros remetentes.
+ocarmelin@ocarmelin.com.br, reaproveitando o mesmo fluxo de captura de
+dados que já lê e-mails de outros remetentes (Vitru, Santa Casa, Marimed).
 
-Variáveis de ambiente necessárias no Render:
-  VERIFY_TOKEN     - string qualquer, usada na verificação do webhook na Meta.
-  WHATSAPP_TOKEN   - token PERMANENTE do app da Meta (Usuário do sistema).
-  MS_TENANT_ID     - ID do diretório (tenant) do Azure AD.
-  MS_CLIENT_ID     - ID do aplicativo (client id) registrado no Azure AD.
-  MS_CLIENT_SECRET - segredo do cliente gerado no Azure AD.
-  REMETENTE_EMAIL  - ocarmelin@ocarmelin.com.br (caixa que manda e recebe).
-  DESTINO_EMAIL    - opcional; se não definir, usa REMETENTE_EMAIL.
+Hospedado no Render.com (grátis pro volume esperado). Precisa das
+variáveis de ambiente abaixo configuradas no painel do Render (nunca
+digitadas direto no código):
+
+  VERIFY_TOKEN     - qualquer string que você inventar (usada só na hora
+                      de configurar o webhook lá na Meta, pra provar que
+                      é você mesmo configurando).
+  WHATSAPP_TOKEN    - o token de acesso PERMANENTE do app da Meta (não o
+                      temporário da Etapa 1 — esse expira em horas).
+  SMTP_USER         - ocarmelin@ocarmelin.com.br
+  SMTP_PASSWORD     - senha (ou senha de app) da caixa ocarmelin@ocarmelin.com.br
+  DESTINO_EMAIL     - opcional; se não definir, usa o próprio SMTP_USER
+                      como destinatário.
+
+NOVO (01/10/2026, a pedido) — também expõe POST /responder: o robô de
+emissão (rodando no PC, depois de emitir uma nota) chama esse endpoint
+pra devolver a confirmação (link + chave) pro WhatsApp de quem pediu.
+Variáveis de ambiente adicionais pra isso:
+
+  WHATSAPP_PHONE_NUMBER_ID - o "Phone number ID" do número 3225-4911 no
+                      Business Manager da Meta (não é o número de
+                      telefone em si — é um ID numérico interno).
+  RESPONDER_SECRET  - outra senha qualquer que você inventar (diferente
+                      do VERIFY_TOKEN) — o robô manda ela num cabeçalho
+                      pra provar que é ele mesmo chamando, não qualquer
+                      um na internet.
 """
 
-import base64
 import os
+import smtplib
+from email.message import EmailMessage
 
 import requests
 from flask import Flask, request, jsonify
@@ -27,17 +45,26 @@ app = Flask(__name__)
 
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]
-MS_TENANT_ID = os.environ["MS_TENANT_ID"]
-MS_CLIENT_ID = os.environ["MS_CLIENT_ID"]
-MS_CLIENT_SECRET = os.environ["MS_CLIENT_SECRET"]
-REMETENTE_EMAIL = os.environ["REMETENTE_EMAIL"]
-DESTINO_EMAIL = os.environ.get("DESTINO_EMAIL", REMETENTE_EMAIL)
+SMTP_USER = os.environ["SMTP_USER"]
+SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
+DESTINO_EMAIL = os.environ.get("DESTINO_EMAIL", SMTP_USER)
 
-GRAPH_URL_WHATSAPP = "https://graph.facebook.com/v25.0"
+# NOVO — usados só pelo endpoint /responder (ver docstring acima). Lidos
+# com .get() (não os["..."]) pra não derrubar o serviço inteiro se ainda
+# não tiverem sido configurados — nesse caso /responder só devolve erro
+# 503 explicando o que falta, o resto do webhook (receber mensagem) segue
+# funcionando normalmente.
+WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
+RESPONDER_SECRET = os.environ.get("RESPONDER_SECRET", "")
+
+GRAPH_URL = "https://graph.facebook.com/v25.0"
 
 
 @app.route("/webhook", methods=["GET"])
 def verificar_webhook():
+    """A Meta chama isso UMA VEZ, na hora de você configurar a URL de
+    callback lá no painel — precisa devolver exatamente o "hub.challenge"
+    que ela manda, senão a verificação falha."""
     modo = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -48,6 +75,9 @@ def verificar_webhook():
 
 @app.route("/webhook", methods=["POST"])
 def receber_webhook():
+    """A Meta chama isso toda vez que chega mensagem nova no número
+    cadastrado. Sempre respondemos 200 rápido (mesmo se algo dentro der
+    erro) — senão a Meta interpreta como falha e fica reenviando."""
     dados = request.get_json(silent=True) or {}
     try:
         for entrada in dados.get("entry", []):
@@ -59,28 +89,9 @@ def receber_webhook():
                 }
                 for msg in valor.get("messages", []):
                     processar_mensagem(msg, contatos)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — nunca pode derrubar o endpoint
         print(f"[ERRO] processando webhook: {exc}")
     return jsonify({"status": "ok"}), 200
-
-
-@app.route("/privacidade")
-def politica_privacidade():
-    return """
-    <h1>Política de Privacidade — Captura Dados (OCArmelin)</h1>
-    <p>Este aplicativo é de uso interno da Organização Contábil Armelin e
-    recebe mensagens do WhatsApp enviadas por clientes (pacientes/clínicas)
-    para fins de emissão de nota fiscal de serviço (NFS-e).</p>
-    <p>As mensagens recebidas (texto, imagens e documentos) são
-    encaminhadas por e-mail para a caixa interna da contabilidade
-    (ocarmelin@ocarmelin.com.br) e usadas apenas para identificar dados
-    da nota fiscal a ser emitida (nome, valor, data do serviço).</p>
-    <p>Não compartilhamos esses dados com terceiros, exceto quando
-    exigido pela emissão da própria nota fiscal junto à Receita Federal /
-    prefeituras (Sistema Nacional NFS-e).</p>
-    <p>Para dúvidas ou solicitação de exclusão de dados, entre em
-    contato: ocarmelin@ocarmelin.com.br</p>
-    """
 
 
 @app.route("/")
@@ -88,12 +99,55 @@ def raiz():
     return "OK — webhook do robô de captura WhatsApp está no ar."
 
 
+@app.route("/responder", methods=["POST"])
+def responder():
+    """NOVO (01/10/2026, a pedido) — o robô de emissão (no PC) chama isso
+    depois de emitir uma nota vinda do WhatsApp, pra devolver a
+    confirmação (link + chave) pra quem pediu. Protegido por um segredo
+    compartilhado (cabeçalho X-Responder-Secret) — sem ele, qualquer um
+    que achasse essa URL conseguiria mandar mensagem usando o número do
+    escritório."""
+    if not WHATSAPP_PHONE_NUMBER_ID or not RESPONDER_SECRET:
+        return jsonify({"erro": "WHATSAPP_PHONE_NUMBER_ID/RESPONDER_SECRET não configurados no Render."}), 503
+
+    segredo_recebido = request.headers.get("X-Responder-Secret", "")
+    if segredo_recebido != RESPONDER_SECRET:
+        return jsonify({"erro": "segredo inválido"}), 403
+
+    dados = request.get_json(silent=True) or {}
+    telefone = dados.get("telefone", "")
+    mensagem = dados.get("mensagem", "")
+    if not telefone or not mensagem:
+        return jsonify({"erro": "faltou 'telefone' e/ou 'mensagem' no corpo da requisição"}), 400
+
+    try:
+        resp = requests.post(
+            f"{GRAPH_URL}/{WHATSAPP_PHONE_NUMBER_ID}/messages",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            json={
+                "messaging_product": "whatsapp",
+                "to": telefone,
+                "type": "text",
+                "text": {"body": mensagem},
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 300:
+            print(f"[ERRO] Meta recusou o envio pra {telefone}: {resp.status_code} {resp.text}")
+            return jsonify({"erro": "Meta recusou o envio", "detalhe": resp.text}), 502
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERRO] enviando WhatsApp pra {telefone}: {exc}")
+        return jsonify({"erro": str(exc)}), 500
+
+    return jsonify({"status": "enviado"}), 200
+
+
 # =========================================================================
 # PROCESSAMENTO DA MENSAGEM
 # =========================================================================
 
 def processar_mensagem(msg, contatos):
-    remetente = msg.get("from", "")
+    remetente = msg.get("from", "")  # número do paciente/clínica, ex.: "5544999998888"
     nome_contato = contatos.get(remetente, "")
     tipo = msg.get("type")
 
@@ -117,9 +171,12 @@ def processar_mensagem(msg, contatos):
 
 
 def baixar_midia(media_id):
+    """Duas chamadas, conforme a API da Meta exige: 1) pega a URL
+    temporária + tipo do arquivo; 2) baixa o conteúdo de fato — as duas
+    autenticadas com o mesmo token do app."""
     headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}"}
     try:
-        resp = requests.get(f"{GRAPH_URL_WHATSAPP}/{media_id}", headers=headers, timeout=20)
+        resp = requests.get(f"{GRAPH_URL}/{media_id}", headers=headers, timeout=20)
         resp.raise_for_status()
         info = resp.json()
         url = info["url"]
@@ -136,56 +193,22 @@ def baixar_midia(media_id):
         return None
 
 
-# =========================================================================
-# ENVIO DE E-MAIL VIA MICROSOFT GRAPH (não usa SMTP — porta bloqueada no Render)
-# =========================================================================
-
-_cache_token = {"valor": None}
-
-
-def obter_token_graph():
-    """Client Credentials flow — token de aplicativo, sem usuário logado."""
-    url = f"https://login.microsoftonline.com/{MS_TENANT_ID}/oauth2/v2.0/token"
-    dados = {
-        "client_id": MS_CLIENT_ID,
-        "client_secret": MS_CLIENT_SECRET,
-        "scope": "https://graph.microsoft.com/.default",
-        "grant_type": "client_credentials",
-    }
-    resp = requests.post(url, data=dados, timeout=20)
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
 def enviar_email(remetente, nome_contato, texto, anexos):
-    token = obter_token_graph()
+    msg = EmailMessage()
     quem = f"{nome_contato} ({remetente})" if nome_contato else remetente
+    msg["Subject"] = f"WhatsApp - {quem}"
+    msg["From"] = SMTP_USER
+    msg["To"] = DESTINO_EMAIL
+    msg.set_content(texto or "(mensagem sem texto — ver anexo)")
 
-    anexos_graph = []
     for nome_arquivo, conteudo, mime in anexos:
-        anexos_graph.append({
-            "@odata.type": "#microsoft.graph.fileAttachment",
-            "name": nome_arquivo,
-            "contentType": mime,
-            "contentBytes": base64.b64encode(conteudo).decode("ascii"),
-        })
+        tipo_principal, subtipo = mime.split("/", 1)
+        msg.add_attachment(conteudo, maintype=tipo_principal, subtype=subtipo, filename=nome_arquivo)
 
-    corpo = {
-        "message": {
-            "subject": f"WhatsApp - {quem}",
-            "body": {"contentType": "Text", "content": texto or "(mensagem sem texto — ver anexo)"},
-            "toRecipients": [{"emailAddress": {"address": DESTINO_EMAIL}}],
-            "attachments": anexos_graph,
-        },
-        "saveToSentItems": "true",
-    }
-
-    url = f"https://graph.microsoft.com/v1.0/users/{REMETENTE_EMAIL}/sendMail"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    resp = requests.post(url, headers=headers, json=corpo, timeout=30)
-    if resp.status_code >= 300:
-        print(f"[ERRO] Graph sendMail falhou ({resp.status_code}): {resp.text[:500]}")
-    resp.raise_for_status()
+    with smtplib.SMTP("smtp.office365.com", 587) as servidor:
+        servidor.starttls()
+        servidor.login(SMTP_USER, SMTP_PASSWORD)
+        servidor.send_message(msg)
 
 
 if __name__ == "__main__":
