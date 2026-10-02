@@ -45,6 +45,7 @@ Variáveis de ambiente adicionais pra isso:
 
 import base64
 import os
+import threading
 import time
 
 import requests
@@ -71,6 +72,37 @@ WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID", "")
 RESPONDER_SECRET = os.environ.get("RESPONDER_SECRET", "")
 
 GRAPH_URL = "https://graph.facebook.com/v25.0"
+
+# NOVO (02/10/2026, a pedido) — evita processar a MESMA mensagem do
+# WhatsApp duas vezes. Causa real observada em produção: quando o webhook
+# demora a responder (ou dá erro) — como aconteceu no apagão do SMTP —, a
+# Meta reenvia a mensagem original automaticamente mais tarde (minutos a
+# horas depois), com o mesmo "id" de mensagem (wamid). Sem essa checagem,
+# o reenvio virava um e-mail de repasse duplicado, capturado pelo monitor
+# como se fosse nota nova — e quase gerou uma SEGUNDA NFS-e da mesma nota.
+# Cache simples em memória (zera se o serviço reiniciar — risco residual
+# aceitável: a Meta reenvia pouquíssimas vezes e o serviço, agora num
+# plano pago, não fica mais "dormindo"/reiniciando por inatividade).
+_mensagens_vistas = set()
+_mensagens_vistas_ordem = []
+_LIMITE_CACHE_DEDUP = 1000
+_lock_dedup = threading.Lock()
+
+
+def ja_processada(msg_id):
+    """True se esse wamid já foi visto antes (reenvio da Meta) — nesse
+    caso o chamador deve pular a mensagem, sem mandar e-mail de novo."""
+    if not msg_id:
+        return False
+    with _lock_dedup:
+        if msg_id in _mensagens_vistas:
+            return True
+        _mensagens_vistas.add(msg_id)
+        _mensagens_vistas_ordem.append(msg_id)
+        if len(_mensagens_vistas_ordem) > _LIMITE_CACHE_DEDUP:
+            mais_antigo = _mensagens_vistas_ordem.pop(0)
+            _mensagens_vistas.discard(mais_antigo)
+        return False
 
 # --- cache simples do token do Graph (client-credentials), pra não pedir
 # um token novo a cada e-mail — eles duram ~1h, renovamos uns minutos antes
@@ -128,6 +160,10 @@ def receber_webhook():
                     for c in valor.get("contacts", [])
                 }
                 for msg in valor.get("messages", []):
+                    if ja_processada(msg.get("id")):
+                        print(f"[INFO] Mensagem {msg.get('id')} já processada antes "
+                              f"(reenvio da Meta) — ignorando pra não duplicar.")
+                        continue
                     processar_mensagem(msg, contatos)
     except Exception as exc:  # noqa: BLE001 — nunca pode derrubar o endpoint
         print(f"[ERRO] processando webhook: {exc}")
