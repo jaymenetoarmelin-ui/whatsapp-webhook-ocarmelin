@@ -45,6 +45,7 @@ Variáveis de ambiente adicionais pra isso:
 
 import base64
 import os
+import re
 import threading
 import time
 
@@ -222,6 +223,11 @@ def responder():
 # PROCESSAMENTO DA MENSAGEM
 # =========================================================================
 
+# Palavra-chave que marca um pedido de nota (a mesma regra do robô no PC:
+# tolera maiúscula/minúscula, "NFSe" sem hífen e espaços a mais).
+RE_PALAVRA_CHAVE = re.compile(r"Emitir\s+NFS\s*-?\s*e\b", re.IGNORECASE)
+
+
 def processar_mensagem(msg, contatos):
     remetente = msg.get("from", "")  # número do paciente/clínica, ex.: "5544999998888"
     nome_contato = contatos.get(remetente, "")
@@ -229,6 +235,7 @@ def processar_mensagem(msg, contatos):
 
     texto = ""
     anexos = []  # lista de (nome_arquivo, bytes, mime)
+    media_id = None
 
     if tipo == "text":
         texto = msg.get("text", {}).get("body", "")
@@ -236,12 +243,23 @@ def processar_mensagem(msg, contatos):
         bloco = msg.get(tipo, {})
         texto = bloco.get("caption", "")
         media_id = bloco.get("id")
-        if media_id:
-            resultado = baixar_midia(media_id)
-            if resultado:
-                anexos.append(resultado)
-    else:
-        texto = f"(tipo de mensagem não tratado pelo robô: {tipo})"
+
+    # NOVO (05/10/2026, a pedido) — só vira e-mail o que for PEDIDO DE
+    # NOTA: mensagem cujo texto (ou legenda do arquivo) contenha a
+    # palavra-chave "Emitir NFS-e". Conversa comum, arquivo sem legenda,
+    # áudio, figurinha etc. são descartados aqui mesmo, sem e-mail — antes
+    # TUDO que chegava no número era repassado e a caixa enchia de
+    # conversa aleatória. O arquivo só é baixado da Meta depois dessa
+    # checagem.
+    if not RE_PALAVRA_CHAVE.search(texto or ""):
+        print(f"[INFO] Mensagem de {remetente} (tipo {tipo}) sem 'Emitir NFS-e' "
+              f"— descartada, sem e-mail.")
+        return
+
+    if media_id:
+        resultado = baixar_midia(media_id)
+        if resultado:
+            anexos.append(resultado)
 
     enviar_email(remetente, nome_contato, texto, anexos)
 
