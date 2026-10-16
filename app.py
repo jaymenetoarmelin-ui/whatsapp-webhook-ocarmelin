@@ -227,6 +227,27 @@ def responder():
 # tolera maiúscula/minúscula, "NFSe" sem hífen e espaços a mais).
 RE_PALAVRA_CHAVE = re.compile(r"Emitir\s+NFS\s*-?\s*e\b", re.IGNORECASE)
 
+# NOVO (16/10/2026) — comandos de CANCELAMENTO de NFS-e (tratados pelo
+# cancelar_nfse.py no servidor). "CANCELAR ..." é repassado de qualquer
+# número (o robô recusa e registra quem não é autorizado); as respostas
+# curtas "SIM <nº>" / "NÃO" só são repassadas dos números autorizados,
+# pra conversa comum ("sim", "não") não encher a caixa de e-mail.
+RE_CANCELAR = re.compile(r"^[ \t*]*CANCELAR\b", re.IGNORECASE | re.MULTILINE)
+RE_CONFIRMACAO = re.compile(r"^\s*\**\s*(SIM(\s+\d+)?|N[ÃA]O)\s*[.!*]*\s*$", re.IGNORECASE)
+TELEFONES_CANCELAMENTO = [
+    re.sub(r"\D", "", t) for t in
+    os.environ.get("CANCELAMENTO_TELEFONES_AUTORIZADOS", "554498357733").split(",")
+    if re.sub(r"\D", "", t)
+]
+
+
+def eh_comando_cancelamento(texto, remetente):
+    if RE_CANCELAR.search(texto or ""):
+        return True
+    tel = re.sub(r"\D", "", remetente or "")
+    autorizado = any(tel.endswith(a) or a.endswith(tel) for a in TELEFONES_CANCELAMENTO) if tel else False
+    return autorizado and bool(RE_CONFIRMACAO.match(texto or ""))
+
 
 def processar_mensagem(msg, contatos):
     remetente = msg.get("from", "")  # número do paciente/clínica, ex.: "5544999998888"
@@ -251,9 +272,9 @@ def processar_mensagem(msg, contatos):
     # TUDO que chegava no número era repassado e a caixa enchia de
     # conversa aleatória. O arquivo só é baixado da Meta depois dessa
     # checagem.
-    if not RE_PALAVRA_CHAVE.search(texto or ""):
-        print(f"[INFO] Mensagem de {remetente} (tipo {tipo}) sem 'Emitir NFS-e' "
-              f"— descartada, sem e-mail.")
+    if not RE_PALAVRA_CHAVE.search(texto or "") and not eh_comando_cancelamento(texto, remetente):
+        print(f"[INFO] Mensagem de {remetente} (tipo {tipo}) sem 'Emitir NFS-e' nem "
+              f"comando de cancelamento — descartada, sem e-mail.")
         return
 
     if media_id:
