@@ -41,9 +41,23 @@ Variáveis de ambiente adicionais pra isso:
                       do VERIFY_TOKEN) — o robô manda ela num cabeçalho
                       pra provar que é ele mesmo chamando, não qualquer
                       um na internet.
+
+NOVO (12/11/2026) — FILA NO POSTGRES: cada pedido também é gravado numa
+fila (banco Postgres do Render) e o robô do servidor busca direto dela
+(GET /fila), sem depender do e-mail da Microsoft. O e-mail continua sendo
+mandado como reserva; o robô descarta a cópia repetida. Variáveis:
+
+  DATABASE_URL      - a "Internal Database URL" do Postgres do Render.
+                      Sem ela, tudo funciona como antes (só e-mail).
+  ALERTA_TELEFONE   - WhatsApp que recebe o aviso quando o robô fica
+                      mais de ALERTA_MINUTOS (padrão 15) sem buscar a fila
+                      (ex.: servidor desligou). Padrão: 554498357733.
+
+O robô se identifica com o mesmo RESPONDER_SECRET do /responder.
 """
 
 import base64
+import json
 import os
 import re
 import threading
@@ -176,6 +190,27 @@ def raiz():
     return "OK — webhook do robô de captura WhatsApp está no ar."
 
 
+def enviar_whatsapp(telefone, mensagem):
+    """Manda texto pelo número do escritório. Devolve (ok, detalhe)."""
+    if not WHATSAPP_PHONE_NUMBER_ID:
+        return False, "WHATSAPP_PHONE_NUMBER_ID não configurado"
+    try:
+        resp = requests.post(
+            f"{GRAPH_URL}/{WHATSAPP_PHONE_NUMBER_ID}/messages",
+            headers={"Authorization": f"Bearer {WHATSAPP_TOKEN}"},
+            json={"messaging_product": "whatsapp", "to": telefone, "type": "text",
+                  "text": {"body": mensagem}},
+            timeout=20,
+        )
+        if resp.status_code >= 300:
+            print(f"[ERRO] Meta recusou o envio pra {telefone}: {resp.status_code} {resp.text}")
+            return False, resp.text
+        return True, ""
+    except Exception as exc:  # noqa: BLE001
+        print(f"[ERRO] enviando WhatsApp pra {telefone}: {exc}")
+        return False, str(exc)
+
+
 @app.route("/responder", methods=["POST"])
 def responder():
     """NOVO (01/10/2026, a pedido) — o robô de emissão (no PC) chama isso
@@ -246,7 +281,10 @@ def eh_comando_cancelamento(texto, remetente):
         return True
     tel = re.sub(r"\D", "", remetente or "")
     autorizado = any(tel.endswith(a) or a.endswith(tel) for a in TELEFONES_CANCELAMENTO) if tel else False
-    return autorizado and bool(RE_CONFIRMACAO.match(texto or ""))
+    # CORRIGIDO (12/11/2026): aceita várias confirmações numa mensagem só
+    # ("SIM 29" e "SIM 30", uma por linha) — antes só passava uma.
+    linhas = [l for l in (texto or "").splitlines() if l.strip()]
+    return autorizado and bool(linhas) and all(RE_CONFIRMACAO.match(l) for l in linhas)
 
 
 def processar_mensagem(msg, contatos):
@@ -277,12 +315,21 @@ def processar_mensagem(msg, contatos):
               f"comando de cancelamento — descartada, sem e-mail.")
         return
 
+    # NOVO (12/11/2026): grava na fila ANTES de tudo. O e-mail vira reserva:
+    # se a Microsoft cair, o robô ainda pega o pedido pela fila.
+    bloco = msg.get(tipo, {}) if media_id else {}
+    fila_gravar(msg.get("id"), remetente, nome_contato, texto, media_id,
+                bloco.get("mime_type", ""), bloco.get("filename", ""))
+
     if media_id:
         resultado = baixar_midia(media_id)
         if resultado:
             anexos.append(resultado)
 
-    enviar_email(remetente, nome_contato, texto, anexos)
+    try:
+        enviar_email(remetente, nome_contato, texto, anexos)
+    except Exception as exc:  # noqa: BLE001 — com a fila, e-mail é só reserva
+        print(f"[ERRO] e-mail de repasse falhou (o pedido está na fila): {exc}")
 
 
 def baixar_midia(media_id):
@@ -347,6 +394,154 @@ def enviar_email(remetente, nome_contato, texto, anexos):
     if resp.status_code >= 300:
         print(f"[ERRO] Graph recusou o envio do e-mail de repasse: {resp.status_code} {resp.text}")
         resp.raise_for_status()
+
+
+# =========================================================================
+# NOVO (12/11/2026) — FILA NO POSTGRES
+# =========================================================================
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+ALERTA_TELEFONE = re.sub(r"\D", "", os.environ.get("ALERTA_TELEFONE", "554498357733"))
+ALERTA_MINUTOS = int(os.environ.get("ALERTA_MINUTOS", "15"))
+DIAS_GUARDAR = int(os.environ.get("FILA_DIAS_GUARDAR", "90"))
+
+
+def _conexao():
+    import psycopg  # só importado quando há banco configurado
+    return psycopg.connect(DATABASE_URL, autocommit=True, connect_timeout=10)
+
+
+def fila_preparar():
+    if not DATABASE_URL:
+        print("[INFO] DATABASE_URL não configurada — fila desligada (só e-mail).")
+        return
+    with _conexao() as c:
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS fila_whatsapp (
+                wamid         TEXT PRIMARY KEY,
+                recebido_em   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                remetente     TEXT NOT NULL,
+                nome          TEXT,
+                texto         TEXT,
+                media_id      TEXT,
+                media_mime    TEXT,
+                media_nome    TEXT,
+                confirmado_em TIMESTAMPTZ
+            )""")
+        c.execute("CREATE INDEX IF NOT EXISTS fila_pendentes ON fila_whatsapp (recebido_em) "
+                  "WHERE confirmado_em IS NULL")
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS robo_status (
+                id              INT PRIMARY KEY,
+                ultimo_contato  TIMESTAMPTZ,
+                alertado        BOOLEAN NOT NULL DEFAULT FALSE
+            )""")
+        # ultimo_contato começa vazio: o vigia só passa a cobrar o robô depois
+        # da primeira busca dele na fila (sem alarme falso antes disso).
+        c.execute("INSERT INTO robo_status (id, ultimo_contato) VALUES (1, NULL) ON CONFLICT DO NOTHING")
+    print("[INFO] Fila no Postgres pronta.")
+
+
+def fila_gravar(wamid, remetente, nome, texto, media_id, media_mime, media_nome):
+    if not DATABASE_URL or not wamid:
+        return
+    try:
+        with _conexao() as c:
+            c.execute("INSERT INTO fila_whatsapp (wamid, remetente, nome, texto, media_id, media_mime, "
+                      "media_nome) VALUES (%s,%s,%s,%s,%s,%s,%s) ON CONFLICT (wamid) DO NOTHING",
+                      (wamid, remetente, nome, texto, media_id, media_mime, media_nome))
+    except Exception as exc:  # noqa: BLE001 — o e-mail ainda leva o pedido
+        print(f"[ERRO] gravando {wamid} na fila: {exc}")
+
+
+def _robo_autenticado():
+    return bool(RESPONDER_SECRET) and request.headers.get("X-Responder-Secret", "") == RESPONDER_SECRET
+
+
+@app.route("/fila", methods=["GET"])
+def fila_listar():
+    """O robô busca aqui, a cada ciclo, os pedidos ainda não confirmados.
+    Cada chamada também conta como 'sinal de vida' do robô."""
+    if not _robo_autenticado():
+        return jsonify({"erro": "segredo inválido"}), 403
+    if not DATABASE_URL:
+        return jsonify({"erro": "fila desligada (DATABASE_URL)"}), 503
+    with _conexao() as c:
+        c.execute("UPDATE robo_status SET ultimo_contato = now() WHERE id = 1")
+        cur = c.execute("SELECT wamid, recebido_em, remetente, nome, texto, media_id, media_mime, media_nome "
+                        "FROM fila_whatsapp WHERE confirmado_em IS NULL ORDER BY recebido_em LIMIT 50")
+        itens = [{"wamid": r[0], "recebido_em": r[1].isoformat(), "remetente": r[2], "nome": r[3] or "",
+                  "texto": r[4] or "", "media_id": r[5], "media_mime": r[6], "media_nome": r[7]}
+                 for r in cur.fetchall()]
+    return jsonify({"itens": itens}), 200
+
+
+@app.route("/fila/confirmar", methods=["POST"])
+def fila_confirmar():
+    """O robô avisa quais pedidos já tratou (gravou na planilha ou descartou)."""
+    if not _robo_autenticado():
+        return jsonify({"erro": "segredo inválido"}), 403
+    ids = (request.get_json(silent=True) or {}).get("wamids") or []
+    if ids:
+        with _conexao() as c:
+            c.execute("UPDATE fila_whatsapp SET confirmado_em = now() "
+                      "WHERE wamid = ANY(%s) AND confirmado_em IS NULL", (list(ids),))
+    return jsonify({"status": "ok", "confirmados": len(ids)}), 200
+
+
+@app.route("/fila/midia/<media_id>", methods=["GET"])
+def fila_midia(media_id):
+    """Entrega ao robô o anexo (ex.: planilha de Agendamentos) baixando
+    da Meta na hora — o arquivo não fica guardado no banco."""
+    if not _robo_autenticado():
+        return jsonify({"erro": "segredo inválido"}), 403
+    resultado = baixar_midia(media_id)
+    if not resultado:
+        return jsonify({"erro": "não consegui baixar o arquivo na Meta"}), 502
+    nome, conteudo, mime = resultado
+    return conteudo, 200, {"Content-Type": mime, "X-Nome-Arquivo": nome}
+
+
+def _vigia():
+    """Roda em segundo plano: avisa no WhatsApp se o robô parar de buscar
+    a fila, avisa quando ele volta, e limpa pedidos antigos já tratados.
+    O UPDATE ... RETURNING garante um aviso só, mesmo com vários workers."""
+    ultima_limpeza = 0
+    while True:
+        time.sleep(60)
+        try:
+            with _conexao() as c:
+                cur = c.execute(
+                    "UPDATE robo_status SET alertado = TRUE WHERE id = 1 AND NOT alertado "
+                    "AND ultimo_contato < now() - make_interval(mins => %s::int) RETURNING ultimo_contato",
+                    (ALERTA_MINUTOS,))
+                parou = cur.fetchone()
+                if parou:
+                    pendentes = c.execute("SELECT count(*) FROM fila_whatsapp "
+                                          "WHERE confirmado_em IS NULL").fetchone()[0]
+                    enviar_whatsapp(ALERTA_TELEFONE, (
+                        f"⚠️ Robô NFS-e PARADO: o servidor não busca pedidos há mais de {ALERTA_MINUTOS} min. "
+                        f"{pendentes} pedido(s) aguardando. Confira se o srv-armelin está ligado e rode "
+                        "Ativar_Robo.bat — os pedidos ficam guardados e são emitidos quando ele voltar."))
+                cur = c.execute(
+                    "UPDATE robo_status SET alertado = FALSE WHERE id = 1 AND alertado "
+                    "AND ultimo_contato > now() - interval '2 minutes' RETURNING id")
+                if cur.fetchone():
+                    enviar_whatsapp(ALERTA_TELEFONE, "✅ Robô NFS-e voltou a buscar os pedidos.")
+                if time.time() - ultima_limpeza > 6 * 3600:
+                    c.execute("DELETE FROM fila_whatsapp WHERE confirmado_em < now() - make_interval(days => %s::int)",
+                              (DIAS_GUARDAR,))
+                    ultima_limpeza = time.time()
+        except Exception as exc:  # noqa: BLE001 — o vigia nunca pode morrer
+            print(f"[ERRO] vigia da fila: {exc}")
+
+
+if DATABASE_URL:
+    try:
+        fila_preparar()
+        threading.Thread(target=_vigia, daemon=True).start()
+    except Exception as exc:  # noqa: BLE001 — sem banco, o webhook segue com e-mail
+        print(f"[ERRO] preparando a fila no Postgres: {exc}")
 
 
 if __name__ == "__main__":
